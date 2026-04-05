@@ -41,7 +41,8 @@ async def ibkr_lifespan(server):
     try:
         await client.connect()
     except Exception as e:
-        logger.warning("Initial connection failed (tools will report offline): %s", e)
+        logger.warning("Initial connection failed, starting reconnect loop: %s", e)
+        client.start_reconnect()
 
     try:
         yield {"client": client, "config": config}

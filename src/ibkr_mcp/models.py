@@ -99,6 +99,8 @@ class ContractSearchInput(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("Search pattern cannot be empty")
+        if len(v) > 64:
+            raise ValueError("Search pattern too long (max 64 characters)")
         return v
 
 
