@@ -16,7 +16,7 @@ async def ibkr_contract_search(pattern: str, ctx: Context) -> str:
         pattern: Search text (e.g. "Apple", "AAPL", "Bitcoin")
     """
     parsed = ContractSearchInput(pattern=pattern)
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.search_contracts(parsed.pattern)
         return json.dumps(result, indent=2)

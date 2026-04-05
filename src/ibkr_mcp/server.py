@@ -18,20 +18,10 @@ from ibkr_mcp.tools.status import ibkr_connection_status
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP(
-    "IBKR Gateway",
-    instructions=(
-        "Read-only access to Interactive Brokers Gateway via the TWS socket API. "
-        "Provides market data, positions, account summaries, option chains, and FX rates. "
-        "No order placement — all operations are read-only."
-    ),
-)
-
 
 # ── Lifespan ───────────────────────────────────────────────────────────────
 
-@mcp.lifespan()
-async def ibkr_lifespan(server):
+async def ibkr_lifespan(server: FastMCP):
     """Connect to IB Gateway on startup, disconnect on shutdown."""
     config = IBKRConfig()
     contract_cache = ContractCache(ttl=config.cache_ttl)
@@ -48,6 +38,19 @@ async def ibkr_lifespan(server):
         yield {"client": client, "config": config}
     finally:
         await client.disconnect()
+
+
+# ── Server ─────────────────────────────────────────────────────────────────
+
+mcp = FastMCP(
+    "IBKR Gateway",
+    instructions=(
+        "Read-only access to Interactive Brokers Gateway via the TWS socket API. "
+        "Provides market data, positions, account summaries, option chains, and FX rates. "
+        "No order placement — all operations are read-only."
+    ),
+    lifespan=ibkr_lifespan,
+)
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────
@@ -67,8 +70,8 @@ mcp.tool()(ibkr_connection_status)
 @mcp.resource("portfolio://positions")
 async def resource_positions(ctx: Context) -> str:
     """Current portfolio positions as context."""
-    client = ctx.request_context.lifespan_context["client"]
-    if not client.is_connected:
+    client = ctx.lifespan_context.get("client")
+    if not client or not client.is_connected:
         return json.dumps({"error": "Not connected to IB Gateway"})
     result = await client.get_positions()
     return json.dumps(result, indent=2)
@@ -77,8 +80,8 @@ async def resource_positions(ctx: Context) -> str:
 @mcp.resource("account://summary")
 async def resource_account_summary(ctx: Context) -> str:
     """Account summary as context."""
-    client = ctx.request_context.lifespan_context["client"]
-    if not client.is_connected:
+    client = ctx.lifespan_context.get("client")
+    if not client or not client.is_connected:
         return json.dumps({"error": "Not connected to IB Gateway"})
     result = await client.get_account_summary()
     return json.dumps(result, indent=2)

@@ -20,7 +20,7 @@ async def ibkr_positions(ctx: Context) -> str:
 
     Returns positions sorted by absolute market value (largest first).
     """
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.get_positions()
         return json.dumps(result, indent=2)
@@ -33,7 +33,7 @@ async def ibkr_account_summary(ctx: Context) -> str:
 
     Returns key account metrics grouped by currency.
     """
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.get_account_summary()
         return json.dumps(result, indent=2)

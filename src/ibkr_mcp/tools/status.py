@@ -13,6 +13,6 @@ async def ibkr_connection_status(ctx: Context) -> str:
     Returns connection state, managed accounts, market data type,
     market hours status, and cache statistics.
     """
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     result = await client.get_connection_status()
     return json.dumps(result, indent=2)

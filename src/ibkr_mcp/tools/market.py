@@ -24,7 +24,7 @@ async def ibkr_quote(symbols: str, ctx: Context) -> str:
         symbols: Comma or space separated symbols (max 20). Example: "AAPL MSFT" or "SPY,QQQ"
     """
     parsed = QuoteInput(symbols=symbols)
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.get_quote(parsed.symbol_list)
         return json.dumps(result, indent=2)
@@ -53,7 +53,7 @@ async def ibkr_historical_bars(
         symbol=symbol, duration=duration, bar_size=bar_size,
         what_to_show=what_to_show, use_rth=use_rth,
     )
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.get_historical_bars(
             parsed.symbol, parsed.duration, parsed.bar_size,
@@ -71,7 +71,7 @@ async def ibkr_fx_rate(pair: str, ctx: Context) -> str:
         pair: Currency pair like "EURUSD", "AUDUSD", "USDJPY"
     """
     parsed = FxRateInput(pair=pair)
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.get_fx_rate(parsed.pair)
         return json.dumps(result, indent=2)
