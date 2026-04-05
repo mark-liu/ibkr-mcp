@@ -22,7 +22,7 @@ class TestToolQuote:
 
     @pytest.mark.asyncio
     async def test_multiple_symbols(self, ctx):
-        ctx.request_context.lifespan_context["client"]._ib.reqTickersAsync.return_value = [
+        ctx.lifespan_context["client"]._ib.reqTickersAsync.return_value = [
             MockTicker(), MockTicker(last=300.0, close=295.0),
         ]
         result = await ibkr_quote("AAPL MSFT", ctx)

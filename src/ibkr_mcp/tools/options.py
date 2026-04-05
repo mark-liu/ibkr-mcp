@@ -21,7 +21,7 @@ async def ibkr_option_chain(symbol: str, exchange: str = "", ctx: Context = None
         exchange: Optional exchange filter (empty = all exchanges)
     """
     parsed = OptionChainInput(symbol=symbol, exchange=exchange)
-    client = ctx.request_context.lifespan_context["client"]
+    client = ctx.lifespan_context["client"]
     try:
         result = await client.get_option_chain(parsed.symbol, parsed.exchange)
         return json.dumps(result, indent=2)

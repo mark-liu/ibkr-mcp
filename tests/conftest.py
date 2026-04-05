@@ -162,20 +162,15 @@ def client(config, contract_cache, response_cache, mock_ib):
     """IBKRClient with mocked IB instance."""
     c = IBKRClient(config, contract_cache, response_cache)
     c._ib = mock_ib
-    c._connected = True
     return c
 
 
 # ── Fake MCP context ──────────────────────────────────────────────────────
 
-class FakeRequestContext:
-    def __init__(self, lifespan_context: dict):
-        self.lifespan_context = lifespan_context
-
-
 class FakeContext:
+    """Mimics fastmcp.Context with lifespan_context dict."""
     def __init__(self, client: IBKRClient):
-        self.request_context = FakeRequestContext({"client": client})
+        self.lifespan_context = {"client": client}
 
 
 @pytest.fixture
