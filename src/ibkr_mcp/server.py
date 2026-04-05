@@ -10,6 +10,11 @@ from fastmcp import FastMCP, Context
 from ibkr_mcp.cache import ContractCache, ResponseCache
 from ibkr_mcp.client import IBKRClient
 from ibkr_mcp.config import IBKRConfig
+from ibkr_mcp.tools.account import ibkr_account_summary, ibkr_positions
+from ibkr_mcp.tools.market import ibkr_fx_rate, ibkr_historical_bars, ibkr_quote
+from ibkr_mcp.tools.options import ibkr_option_chain
+from ibkr_mcp.tools.search import ibkr_contract_search
+from ibkr_mcp.tools.status import ibkr_connection_status
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +50,6 @@ async def ibkr_lifespan(server):
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────
-
-from ibkr_mcp.tools.market import ibkr_quote, ibkr_historical_bars, ibkr_fx_rate
-from ibkr_mcp.tools.account import ibkr_positions, ibkr_account_summary
-from ibkr_mcp.tools.options import ibkr_option_chain
-from ibkr_mcp.tools.search import ibkr_contract_search
-from ibkr_mcp.tools.status import ibkr_connection_status
 
 mcp.tool()(ibkr_quote)
 mcp.tool()(ibkr_historical_bars)

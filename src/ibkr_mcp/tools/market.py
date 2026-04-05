@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from fastmcp import Context
 
 from ibkr_mcp.models import FxRateInput, HistoricalBarsInput, QuoteInput
+
+
+def _error_or_cached(e: Exception) -> str:
+    """Return cached data if available on ConnectionError, otherwise error JSON."""
+    cached = getattr(e, "cached_data", None)
+    if cached is not None:
+        return json.dumps({"stale": True, "data": cached}, indent=2)
+    return json.dumps({"error": str(e)})
 
 
 async def ibkr_quote(symbols: str, ctx: Context) -> str:
@@ -18,8 +25,11 @@ async def ibkr_quote(symbols: str, ctx: Context) -> str:
     """
     parsed = QuoteInput(symbols=symbols)
     client = ctx.request_context.lifespan_context["client"]
-    result = await client.get_quote(parsed.symbol_list)
-    return json.dumps(result, indent=2)
+    try:
+        result = await client.get_quote(parsed.symbol_list)
+        return json.dumps(result, indent=2)
+    except ConnectionError as e:
+        return _error_or_cached(e)
 
 
 async def ibkr_historical_bars(
@@ -44,11 +54,14 @@ async def ibkr_historical_bars(
         what_to_show=what_to_show, use_rth=use_rth,
     )
     client = ctx.request_context.lifespan_context["client"]
-    result = await client.get_historical_bars(
-        parsed.symbol, parsed.duration, parsed.bar_size,
-        parsed.what_to_show, parsed.use_rth,
-    )
-    return json.dumps(result, indent=2)
+    try:
+        result = await client.get_historical_bars(
+            parsed.symbol, parsed.duration, parsed.bar_size,
+            parsed.what_to_show, parsed.use_rth,
+        )
+        return json.dumps(result, indent=2)
+    except ConnectionError as e:
+        return _error_or_cached(e)
 
 
 async def ibkr_fx_rate(pair: str, ctx: Context) -> str:
@@ -59,5 +72,8 @@ async def ibkr_fx_rate(pair: str, ctx: Context) -> str:
     """
     parsed = FxRateInput(pair=pair)
     client = ctx.request_context.lifespan_context["client"]
-    result = await client.get_fx_rate(parsed.pair)
-    return json.dumps(result, indent=2)
+    try:
+        result = await client.get_fx_rate(parsed.pair)
+        return json.dumps(result, indent=2)
+    except ConnectionError as e:
+        return _error_or_cached(e)

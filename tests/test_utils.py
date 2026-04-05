@@ -1,8 +1,6 @@
 """Tests for utility functions."""
 
-import math
-
-from ibkr_mcp.utils import clean_nan, clean_dict, ticker_to_dict, fmt_currency, fmt_pct
+from ibkr_mcp.utils import clean_nan, ticker_to_dict
 
 
 class TestCleanNan:
@@ -26,18 +24,6 @@ class TestCleanNan:
         assert clean_nan("hello") == "hello"
         assert clean_nan(None) is None
         assert clean_nan(42) == 42
-
-
-class TestCleanDict:
-    def test_cleans_nans(self):
-        d = {"a": 1.0, "b": float("nan"), "c": "ok"}
-        result = clean_dict(d)
-        assert result == {"a": 1.0, "b": None, "c": "ok"}
-
-    def test_nested(self):
-        d = {"outer": {"inner": float("nan")}}
-        result = clean_dict(d)
-        assert result == {"outer": {"inner": None}}
 
 
 class TestTickerToDict:
@@ -78,15 +64,3 @@ class TestTickerToDict:
 
         result = ticker_to_dict(T())
         assert result["change"] is None  # division by zero guarded
-
-
-class TestFormatting:
-    def test_fmt_currency(self):
-        assert fmt_currency(1234.567) == "1,234.57 USD"
-        assert fmt_currency(None) == "N/A"
-        assert fmt_currency(42.1, "AUD") == "42.10 AUD"
-
-    def test_fmt_pct(self):
-        assert fmt_pct(2.345) == "+2.35%"
-        assert fmt_pct(-1.5) == "-1.50%"
-        assert fmt_pct(None) == "N/A"

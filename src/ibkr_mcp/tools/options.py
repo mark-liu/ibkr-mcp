@@ -22,5 +22,8 @@ async def ibkr_option_chain(symbol: str, exchange: str = "", ctx: Context = None
     """
     parsed = OptionChainInput(symbol=symbol, exchange=exchange)
     client = ctx.request_context.lifespan_context["client"]
-    result = await client.get_option_chain(parsed.symbol, parsed.exchange)
-    return json.dumps(result, indent=2)
+    try:
+        result = await client.get_option_chain(parsed.symbol, parsed.exchange)
+        return json.dumps(result, indent=2)
+    except ConnectionError as e:
+        return json.dumps({"error": str(e)})
