@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP, Context
 
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ── Lifespan ───────────────────────────────────────────────────────────────
 
+@asynccontextmanager
 async def ibkr_lifespan(server: FastMCP):
     """Connect to IB Gateway on startup, disconnect on shutdown."""
     config = IBKRConfig()
