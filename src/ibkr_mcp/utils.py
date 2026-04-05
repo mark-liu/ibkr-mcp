@@ -1,15 +1,11 @@
-"""Utility functions: NaN handling, formatting, rate limiting, retry."""
+"""Utility functions: NaN handling, rate limiting."""
 
 from __future__ import annotations
 
 import asyncio
 import math
 import time
-from collections.abc import Awaitable, Callable
-from functools import wraps
-from typing import Any, TypeVar
-
-T = TypeVar("T")
+from typing import Any
 
 
 # ── NaN handling ───────────────────────────────────────────────────────────
@@ -19,11 +15,6 @@ def clean_nan(value: Any) -> Any:
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return None
     return value
-
-
-def clean_dict(d: dict[str, Any]) -> dict[str, Any]:
-    """Recursively clean NaN values from a dict."""
-    return {k: clean_nan(v) if not isinstance(v, dict) else clean_dict(v) for k, v in d.items()}
 
 
 def ticker_to_dict(ticker: Any) -> dict[str, Any]:
@@ -52,20 +43,6 @@ def ticker_to_dict(ticker: Any) -> dict[str, Any]:
     }
 
 
-# ── Formatting ─────────────────────────────────────────────────────────────
-
-def fmt_currency(value: float | None, currency: str = "USD") -> str:
-    if value is None:
-        return "N/A"
-    return f"{value:,.2f} {currency}"
-
-
-def fmt_pct(value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    return f"{value:+.2f}%"
-
-
 # ── Rate limiter ───────────────────────────────────────────────────────────
 
 class RateLimiter:
@@ -91,30 +68,3 @@ class RateLimiter:
 # Global rate limiters matching IB API limits
 market_data_limiter = RateLimiter(max_per_second=45)
 historical_data_limiter = RateLimiter(max_per_second=1)
-
-
-# ── Retry decorator ────────────────────────────────────────────────────────
-
-def with_retry(
-    max_retries: int = 3,
-    delay: float = 1.0,
-    backoff: float = 2.0,
-    exceptions: tuple[type[Exception], ...] = (ConnectionError, asyncio.TimeoutError),
-) -> Callable:
-    """Retry decorator with exponential backoff for async functions."""
-    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            last_exc: Exception | None = None
-            current_delay = delay
-            for attempt in range(max_retries + 1):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    last_exc = e
-                    if attempt < max_retries:
-                        await asyncio.sleep(current_delay)
-                        current_delay *= backoff
-            raise last_exc  # type: ignore[misc]
-        return wrapper
-    return decorator

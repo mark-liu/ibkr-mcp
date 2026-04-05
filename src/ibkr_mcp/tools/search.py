@@ -17,5 +17,8 @@ async def ibkr_contract_search(pattern: str, ctx: Context) -> str:
     """
     parsed = ContractSearchInput(pattern=pattern)
     client = ctx.request_context.lifespan_context["client"]
-    result = await client.search_contracts(parsed.pattern)
-    return json.dumps(result, indent=2)
+    try:
+        result = await client.search_contracts(parsed.pattern)
+        return json.dumps(result, indent=2)
+    except ConnectionError as e:
+        return json.dumps({"error": str(e)})

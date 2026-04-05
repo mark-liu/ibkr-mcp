@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
-from datetime import datetime, timezone
 from typing import Any
 
 from ib_async import IB, Contract, Forex, Stock
@@ -38,7 +36,7 @@ class IBKRClient:
         self._ib = IB()
         self._contract_cache = contract_cache
         self._response_cache = response_cache
-        self._connected = False
+        self._reconnecting = False  # guard for reconnect loop only
         self._reconnect_task: asyncio.Task[None] | None = None
         self._last_error: str | None = None
 
@@ -58,12 +56,11 @@ class IBKRClient:
             )
             mdt = 1 if _is_market_open() else self._config.market_data_type
             self._ib.reqMarketDataType(mdt)
-            self._connected = True
+            self._reconnecting = False
             self._last_error = None
             logger.info("Connected to IB Gateway at %s:%d (market data type: %d)",
                         self._config.host, self._config.port, mdt)
         except Exception as e:
-            self._connected = False
             self._last_error = str(e)
             raise
 
@@ -76,10 +73,10 @@ class IBKRClient:
             except asyncio.CancelledError:
                 pass
         self._ib.disconnect()
-        self._connected = False
+        self._reconnecting = False
 
     def _on_disconnect(self) -> None:
-        self._connected = False
+        self._reconnecting = True
         self._last_error = "Disconnected from IB Gateway"
         logger.warning("Disconnected from IB Gateway — starting reconnect loop")
         if self._reconnect_task is None or self._reconnect_task.done():
@@ -87,7 +84,7 @@ class IBKRClient:
 
     async def _reconnect_loop(self) -> None:
         """Background loop that retries connection until successful."""
-        while not self._connected:
+        while self._reconnecting and not self.is_connected:
             await asyncio.sleep(self._config.reconnect_interval)
             try:
                 await self.connect()
@@ -102,6 +99,19 @@ class IBKRClient:
     @property
     def last_error(self) -> str | None:
         return self._last_error
+
+    def _require_connected(self, cache_key: str | None = None) -> None:
+        """Raise ConnectionError if not connected. Returns cached data if available."""
+        if not self.is_connected:
+            if cache_key:
+                cached = self._response_cache.get(cache_key)
+                if cached is not None:
+                    data, _ = cached
+                    # Raise with cached data attached for callers to handle
+                    err = ConnectionError("Not connected to IB Gateway")
+                    err.cached_data = data  # type: ignore[attr-defined]
+                    raise err
+            raise ConnectionError("Not connected to IB Gateway")
 
     # ── Contract resolution with caching ───────────────────────────────────
 
@@ -277,8 +287,8 @@ class IBKRClient:
                     val = round(float(val), 2)
                 except (ValueError, TypeError):
                     pass
-                key = f"{item.tag}"
-                if item.currency and item.currency != "":
+                key = item.tag
+                if item.currency:
                     key = f"{item.tag}_{item.currency}"
                 result[key] = val
 
@@ -338,7 +348,7 @@ class IBKRClient:
         ticker = tickers[0]
         bid = clean_nan(ticker.bid)
         ask = clean_nan(ticker.ask)
-        midpoint = round((bid + ask) / 2, 6) if bid and ask else clean_nan(ticker.last)
+        midpoint = round((bid + ask) / 2, 6) if bid is not None and ask is not None else clean_nan(ticker.last)
 
         return {
             "pair": pair,
