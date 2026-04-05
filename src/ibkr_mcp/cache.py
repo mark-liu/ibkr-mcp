@@ -5,15 +5,21 @@ from __future__ import annotations
 import time
 from typing import Any
 
+# Reasonable upper bounds to prevent memory exhaustion
+_MAX_CONTRACT_CACHE = 500
+_MAX_RESPONSE_CACHE = 100
+
 
 class ContractCache:
     """Cache qualified IB contracts to avoid redundant API calls.
 
     Keys are formatted as "SEC_TYPE:SYMBOL:EXCHANGE:CURRENCY".
+    Bounded to prevent memory exhaustion from unbounded symbol queries.
     """
 
-    def __init__(self, ttl: int = 3600) -> None:
+    def __init__(self, ttl: int = 3600, max_size: int = _MAX_CONTRACT_CACHE) -> None:
         self._ttl = ttl
+        self._max_size = max_size
         self._entries: dict[str, tuple[Any, float]] = {}
 
     @staticmethod
@@ -31,6 +37,8 @@ class ContractCache:
         return contract
 
     def put(self, key: str, contract: Any) -> None:
+        if len(self._entries) >= self._max_size:
+            self._evict_oldest()
         self._entries[key] = (contract, time.monotonic())
 
     def clear(self) -> None:
@@ -40,6 +48,13 @@ class ContractCache:
     def size(self) -> int:
         return len(self._entries)
 
+    def _evict_oldest(self) -> None:
+        """Remove the oldest entry to make room."""
+        if not self._entries:
+            return
+        oldest_key = min(self._entries, key=lambda k: self._entries[k][1])
+        del self._entries[oldest_key]
+
 
 class ResponseCache:
     """Short-TTL cache for graceful degradation when gateway is offline.
@@ -48,8 +63,9 @@ class ResponseCache:
     instead of errors when the gateway disconnects temporarily.
     """
 
-    def __init__(self, ttl: int = 120) -> None:
+    def __init__(self, ttl: int = 120, max_size: int = _MAX_RESPONSE_CACHE) -> None:
         self._ttl = ttl
+        self._max_size = max_size
         self._entries: dict[str, tuple[Any, float]] = {}
 
     def get(self, key: str) -> tuple[Any, bool] | None:
@@ -62,4 +78,12 @@ class ResponseCache:
         return data, is_stale
 
     def put(self, key: str, data: Any) -> None:
+        if len(self._entries) >= self._max_size:
+            self._evict_oldest()
         self._entries[key] = (data, time.monotonic())
+
+    def _evict_oldest(self) -> None:
+        if not self._entries:
+            return
+        oldest_key = min(self._entries, key=lambda k: self._entries[k][1])
+        del self._entries[oldest_key]

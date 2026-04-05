@@ -75,12 +75,16 @@ class IBKRClient:
         self._ib.disconnect()
         self._reconnecting = False
 
-    def _on_disconnect(self) -> None:
+    def start_reconnect(self) -> None:
+        """Start the background reconnect loop (idempotent)."""
         self._reconnecting = True
-        self._last_error = "Disconnected from IB Gateway"
-        logger.warning("Disconnected from IB Gateway — starting reconnect loop")
         if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    def _on_disconnect(self) -> None:
+        self._last_error = "Disconnected from IB Gateway"
+        logger.warning("Disconnected from IB Gateway — starting reconnect loop")
+        self.start_reconnect()
 
     async def _reconnect_loop(self) -> None:
         """Background loop that retries connection until successful."""
@@ -256,7 +260,7 @@ class IBKRClient:
                 "exchange": con.exchange,
                 "currency": con.currency,
                 "quantity": float(pos.position),
-                "avg_cost": round(pos.avgCost, 4),
+                "avg_cost": round(pos.avgCost, 4) if pos.avgCost and pos.avgCost == pos.avgCost else None,
                 "market_price": market_price,
                 "market_value": market_value,
                 "unrealized_pnl": unrealized_pnl,
