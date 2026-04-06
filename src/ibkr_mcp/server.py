@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
+import subprocess
+import time
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP, Context
@@ -20,11 +24,40 @@ from ibkr_mcp.tools.status import ibkr_connection_status
 logger = logging.getLogger(__name__)
 
 
+def _kill_orphan_ibkr_mcp() -> None:
+    """Kill any existing ibkr_mcp processes that would hold our client ID.
+
+    When Claude Code restarts, the old MCP server process may linger as an
+    orphan, holding the IB Gateway client ID slot and blocking the new process.
+    """
+    my_pid = os.getpid()
+    killed = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", r"python.*-m ibkr_mcp$"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            pid = int(line.strip())
+            if pid != my_pid:
+                logger.info("Killing orphan ibkr_mcp process (PID %d)", pid)
+                os.kill(pid, signal.SIGTERM)
+                killed = True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        logger.debug("Orphan cleanup skipped: pgrep unavailable or timed out")
+    except (ProcessLookupError, PermissionError, ValueError) as e:
+        logger.debug("Orphan cleanup: %s", e)
+    if killed:
+        time.sleep(1)  # let orphan release client ID slot before we connect
+
+
 # ── Lifespan ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def ibkr_lifespan(server: FastMCP):
     """Connect to IB Gateway on startup, disconnect on shutdown."""
+    _kill_orphan_ibkr_mcp()
+
     config = IBKRConfig()
     contract_cache = ContractCache(ttl=config.cache_ttl)
     response_cache = ResponseCache(ttl=120)
