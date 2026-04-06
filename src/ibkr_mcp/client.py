@@ -91,6 +91,11 @@ class IBKRClient:
         while self._reconnecting and not self.is_connected:
             await asyncio.sleep(self._config.reconnect_interval)
             try:
+                # Tear down stale connection state and create fresh IB instance
+                # to avoid ib_async internal state corruption after disconnect.
+                self._ib.disconnect()
+                self._ib = IB()
+                self._ib.disconnectedEvent += self._on_disconnect
                 await self.connect()
                 logger.info("Reconnected to IB Gateway")
             except Exception as e:
