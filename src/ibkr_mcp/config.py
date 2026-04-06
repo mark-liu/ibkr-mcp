@@ -13,3 +13,4 @@ class IBKRConfig:
         self.market_data_type: int = int(os.getenv("IB_MARKET_DATA_TYPE", "3"))
         self.reconnect_interval: int = int(os.getenv("IB_RECONNECT_INTERVAL", "30"))
         self.cache_ttl: int = int(os.getenv("IB_CACHE_TTL", "3600"))
+        self.heartbeat_interval: int = int(os.getenv("IB_HEARTBEAT_INTERVAL", "60"))

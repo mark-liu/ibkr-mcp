@@ -38,6 +38,7 @@ class IBKRClient:
         self._response_cache = response_cache
         self._reconnecting = False  # guard for reconnect loop only
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self._last_error: str | None = None
 
         self._ib.disconnectedEvent += self._on_disconnect
@@ -58,6 +59,7 @@ class IBKRClient:
             self._ib.reqMarketDataType(mdt)
             self._reconnecting = False
             self._last_error = None
+            await self._start_heartbeat()
             logger.info("Connected to IB Gateway at %s:%d (market data type: %d)",
                         self._config.host, self._config.port, mdt)
         except Exception as e:
@@ -65,15 +67,23 @@ class IBKRClient:
             raise
 
     async def disconnect(self) -> None:
-        """Disconnect and cancel any reconnect task."""
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
+        """Disconnect and cancel any background tasks."""
+        self._reconnecting = False
+        # Detach event handler before disconnect to prevent _on_disconnect
+        # from starting a reconnect loop during intentional shutdown.
+        self._ib.disconnectedEvent -= self._on_disconnect
+        await self._cancel_task(self._heartbeat_task)
+        await self._cancel_task(self._reconnect_task)
+        self._ib.disconnect()
+
+    @staticmethod
+    async def _cancel_task(task: asyncio.Task[None] | None) -> None:
+        if task and not task.done():
+            task.cancel()
             try:
-                await self._reconnect_task
+                await task
             except asyncio.CancelledError:
                 pass
-        self._ib.disconnect()
-        self._reconnecting = False
 
     def start_reconnect(self) -> None:
         """Start the background reconnect loop (idempotent)."""
@@ -100,6 +110,35 @@ class IBKRClient:
                 logger.info("Reconnected to IB Gateway")
             except Exception as e:
                 logger.debug("Reconnect attempt failed: %s", e)
+
+    # ── Heartbeat watchdog ───────────────────────────────────────────────
+
+    async def _start_heartbeat(self) -> None:
+        """Start the heartbeat watchdog (idempotent). Cancels any existing task."""
+        await self._cancel_task(self._heartbeat_task)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically verify the API connection is actually functional.
+
+        Detects zombie Gateway: TCP socket alive but API unresponsive.
+        If reqCurrentTime hangs or fails, tear down and trigger reconnect.
+        connect() restarts this loop via _start_heartbeat().
+        """
+        while True:
+            await asyncio.sleep(self._config.heartbeat_interval)
+            if not self._ib.isConnected():
+                return  # exit loop; connect() will restart via _start_heartbeat()
+            try:
+                await asyncio.wait_for(
+                    self._ib.reqCurrentTimeAsync(),
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.warning("Heartbeat failed (%s) — forcing reconnect", e)
+                self._last_error = f"Heartbeat failed: {e}"
+                self._ib.disconnect()
+                # _on_disconnect handler will start the reconnect loop
 
     @property
     def is_connected(self) -> bool:
@@ -265,7 +304,7 @@ class IBKRClient:
                 "exchange": con.exchange,
                 "currency": con.currency,
                 "quantity": float(pos.position),
-                "avg_cost": round(pos.avgCost, 4) if pos.avgCost and pos.avgCost == pos.avgCost else None,
+                "avg_cost": round(v, 4) if (v := clean_nan(pos.avgCost)) is not None else None,
                 "market_price": market_price,
                 "market_value": market_value,
                 "unrealized_pnl": unrealized_pnl,
