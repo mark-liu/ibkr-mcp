@@ -105,6 +105,48 @@ class TestSearchContracts:
         assert result[0]["symbol"] == "AAPL"
 
 
+class TestReconnect:
+    @pytest.mark.asyncio
+    async def test_reconnect_creates_fresh_ib_instance(self, config, contract_cache, response_cache):
+        """After disconnect, reconnect loop should create a new IB() instance
+        to avoid stale internal state from the dead connection."""
+        from unittest.mock import patch, MagicMock, AsyncMock
+        from ibkr_mcp.client import IBKRClient
+
+        c = IBKRClient(config, contract_cache, response_cache)
+        old_ib = c._ib
+
+        # Simulate a disconnect then one reconnect iteration
+        c._reconnecting = True
+
+        # Patch IB constructor to track fresh instance creation
+        fresh_ib = make_mock_ib(connected=True)
+        with patch("ibkr_mcp.client.IB", return_value=fresh_ib):
+            # Patch sleep to not actually wait
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                # Run one iteration: the loop checks is_connected, sleeps,
+                # disconnects old, creates new IB, connects, then checks again
+                # We need is_connected to return False first, then True after connect
+                call_count = 0
+
+                def connected_side_effect():
+                    nonlocal call_count
+                    call_count += 1
+                    # First two calls (loop condition + _ensure_market_data_type): False
+                    # After connect succeeds: True
+                    return call_count > 2
+
+                fresh_ib.isConnected.side_effect = connected_side_effect
+
+                await c._reconnect_loop()
+
+        # Verify: old IB was replaced with fresh instance
+        assert c._ib is not old_ib
+        assert c._ib is fresh_ib
+        # Verify: disconnect event handler re-attached
+        fresh_ib.disconnectedEvent.__iadd__.assert_called()
+
+
 class TestContractCaching:
     @pytest.mark.asyncio
     async def test_cache_hit(self, client):
