@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -63,21 +64,28 @@ async def ibkr_lifespan(server: FastMCP):
     response_cache = ResponseCache(ttl=120)
     client = IBKRClient(config, contract_cache, response_cache)
 
+    launch_task: asyncio.Task[None] | None = None
     try:
         await client.connect()
     except Exception as e:
         logger.warning("Initial connection failed: %s", e)
-        # If Gateway isn't running, try to launch it right now so the login
-        # window shows up immediately (instead of waiting for the first
-        # reconnect-loop iteration ~30s later). Then start the patient
-        # cold-start reconnect loop — it waits indefinitely for the user to
-        # sign in and never kills a healthy login screen.
-        await client._launch_gateway_if_needed()
+        # Spawn the launcher as a background task — the launch script can
+        # take up to 3 minutes (1Password unlock, 2FA, etc.) and we MUST NOT
+        # block the MCP lifespan on it, or Claude Code's handshake times out
+        # before the server yields. The reconnect loop will pick up the
+        # connection as soon as port 4001 opens.
+        launch_task = asyncio.create_task(client._launch_gateway_if_needed())
         client.start_reconnect()
 
     try:
         yield {"client": client, "config": config}
     finally:
+        if launch_task and not launch_task.done():
+            launch_task.cancel()
+            try:
+                await launch_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await client.disconnect()
 
 
