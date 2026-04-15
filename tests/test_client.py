@@ -313,6 +313,182 @@ class TestGatewaySupervision:
         c._ib.reqCurrentTimeAsync.assert_not_called()
 
 
+class TestColdStartPatience:
+    """Before the first-ever successful connection, never kill the Gateway —
+    the user is probably at the login screen."""
+
+    def _make_client(self, config, contract_cache, response_cache):
+        from ibkr_mcp.client import IBKRClient
+        return IBKRClient(config, contract_cache, response_cache)
+
+    @pytest.mark.asyncio
+    async def test_cold_start_reconnect_never_restarts_with_live_process(
+        self, config, contract_cache, response_cache
+    ):
+        """User is at the login screen (process alive, port closed). The
+        reconnect loop must not escalate to kill+restart no matter how many
+        iterations fail."""
+        from unittest.mock import patch, AsyncMock, MagicMock
+        c = self._make_client(config, contract_cache, response_cache)
+        assert c._has_ever_connected is False
+
+        c._reconnecting = True
+        # Every connect attempt fails — user hasn't logged in yet.
+        failing_ib = make_mock_ib(connected=False)
+        failing_ib.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("nope"))
+
+        iterations = {"n": 0}
+
+        async def sleep_side_effect(*args, **kwargs):
+            iterations["n"] += 1
+            if iterations["n"] >= 5:
+                c._reconnecting = False
+
+        with patch("ibkr_mcp.client.IB", return_value=failing_ib), \
+             patch("ibkr_mcp.client.asyncio.sleep", side_effect=sleep_side_effect), \
+             patch.object(c, "_is_gateway_process_alive", return_value=True), \
+             patch.object(c, "_restart_gateway", new=AsyncMock(return_value=True)) as rg:
+            await c._reconnect_loop()
+
+        rg.assert_not_called()
+        assert c._reconnect_failures >= 4
+        assert c._last_error == "Waiting for login at IB Gateway"
+
+    @pytest.mark.asyncio
+    async def test_cold_start_reports_process_missing(
+        self, config, contract_cache, response_cache
+    ):
+        """Gateway process isn't running at all — surface that in last_error
+        without escalating."""
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        c._reconnecting = True
+
+        failing_ib = make_mock_ib(connected=False)
+        failing_ib.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("nope"))
+
+        iterations = {"n": 0}
+
+        async def sleep_side_effect(*args, **kwargs):
+            iterations["n"] += 1
+            if iterations["n"] >= 3:
+                c._reconnecting = False
+
+        with patch("ibkr_mcp.client.IB", return_value=failing_ib), \
+             patch("ibkr_mcp.client.asyncio.sleep", side_effect=sleep_side_effect), \
+             patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch.object(c, "_restart_gateway", new=AsyncMock(return_value=True)) as rg:
+            await c._reconnect_loop()
+
+        rg.assert_not_called()
+        assert c._last_error == "IB Gateway not running"
+
+    @pytest.mark.asyncio
+    async def test_post_login_reconnect_escalates(
+        self, config, contract_cache, response_cache
+    ):
+        """Once we've been connected, a subsequent drop should escalate to
+        kill+restart after max_reconnect_before_restart failures."""
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        c._has_ever_connected = True  # we were logged in before
+        c._reconnecting = True
+
+        failing_ib = make_mock_ib(connected=False)
+        failing_ib.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("nope"))
+
+        restart_calls = {"reasons": []}
+
+        async def stop_after_restart(*, reason):
+            restart_calls["reasons"].append(reason)
+            c._reconnecting = False
+            return True
+
+        with patch("ibkr_mcp.client.IB", return_value=failing_ib), \
+             patch("ibkr_mcp.client.asyncio.sleep", new=AsyncMock()), \
+             patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch.object(c, "_restart_gateway", new=AsyncMock(side_effect=stop_after_restart)) as rg:
+            await c._reconnect_loop()
+
+        rg.assert_called_once()
+        # Should escalate only after hitting the failure threshold
+        assert f"{c._config.max_reconnect_before_restart} failed reconnects" in restart_calls["reasons"][0]
+
+    @pytest.mark.asyncio
+    async def test_connect_sets_has_ever_connected(
+        self, config, contract_cache, response_cache
+    ):
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        c._ib = make_mock_ib(connected=True)
+        assert c._has_ever_connected is False
+
+        with patch("ibkr_mcp.client._is_market_open", return_value=False), \
+             patch.object(c, "_start_heartbeat", new=AsyncMock()):
+            await c.connect()
+
+        assert c._has_ever_connected is True
+
+
+class TestLaunchGatewayIfNeeded:
+    """Cold-start auto-launch helper called from the MCP lifespan."""
+
+    def _make_client(self, config, contract_cache, response_cache):
+        from ibkr_mcp.client import IBKRClient
+        return IBKRClient(config, contract_cache, response_cache)
+
+    @pytest.mark.asyncio
+    async def test_noop_when_process_alive(
+        self, config, contract_cache, response_cache
+    ):
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        with patch.object(c, "_is_gateway_process_alive", return_value=True), \
+             patch("ibkr_mcp.client.asyncio.create_subprocess_exec",
+                   new=AsyncMock()) as spawn:
+            await c._launch_gateway_if_needed()
+        spawn.assert_not_called()
+        assert c._last_error == "Waiting for login at IB Gateway"
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_script_configured(
+        self, config, contract_cache, response_cache
+    ):
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        c._config.gateway_restart_script = ""
+        with patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch("ibkr_mcp.client.asyncio.create_subprocess_exec",
+                   new=AsyncMock()) as spawn:
+            await c._launch_gateway_if_needed()
+        spawn.assert_not_called()
+        assert "no launch script" in (c._last_error or "")
+
+    @pytest.mark.asyncio
+    async def test_runs_script_when_process_dead(
+        self, config, contract_cache, response_cache, tmp_path
+    ):
+        from unittest.mock import patch, AsyncMock, MagicMock
+        c = self._make_client(config, contract_cache, response_cache)
+
+        script = tmp_path / "fake-start.sh"
+        script.write_text("#!/bin/bash\nexit 0\n")
+        script.chmod(0o755)
+        c._config.gateway_restart_script = str(script)
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch("ibkr_mcp.client.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=fake_proc)) as spawn:
+            await c._launch_gateway_if_needed()
+
+        spawn.assert_called_once()
+        assert c._last_error == "Waiting for login at IB Gateway"
+
+
 class TestContractCaching:
     @pytest.mark.asyncio
     async def test_cache_hit(self, client):

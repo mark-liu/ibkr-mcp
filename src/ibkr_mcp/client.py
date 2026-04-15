@@ -46,6 +46,10 @@ class IBKRClient:
         self._last_error: str | None = None
         self._reconnect_failures: int = 0
         self._restart_lock = asyncio.Lock()
+        # Flipped True once we've ever connected successfully. Gates the
+        # aggressive kill+restart path so we don't nuke a healthy login
+        # window that is simply waiting for the user to sign in.
+        self._has_ever_connected: bool = False
 
         self._ib.disconnectedEvent += self._on_disconnect
 
@@ -65,6 +69,7 @@ class IBKRClient:
             self._ib.reqMarketDataType(mdt)
             self._reconnecting = False
             self._last_error = None
+            self._has_ever_connected = True
             await self._start_heartbeat()
             logger.info("Connected to IB Gateway at %s:%d (market data type: %d)",
                         self._config.host, self._config.port, mdt)
@@ -105,9 +110,17 @@ class IBKRClient:
     async def _reconnect_loop(self) -> None:
         """Background loop that retries connection until successful.
 
-        After `max_reconnect_before_restart` consecutive failures, escalate to
-        a full Gateway kill+relaunch — handles the case where the app is stuck
-        on a "reconnect" dialog after a long-running session.
+        Two regimes:
+
+        * **Cold start** (`_has_ever_connected is False`): wait patiently. The
+          Gateway is almost certainly sitting on its login screen waiting for
+          the user. Never kill anything — a login window looks superficially
+          like a "stuck dialog" and we'd happily nuke the user mid-typing.
+
+        * **Post-login** (`_has_ever_connected is True`): we were connected
+          and now we're not, so something is genuinely wedged. After
+          `max_reconnect_before_restart` failures (or an obvious stuck
+          reconnect dialog), escalate to a full kill+relaunch.
         """
         while self._reconnecting and not self.is_connected:
             await asyncio.sleep(self._config.reconnect_interval)
@@ -124,8 +137,18 @@ class IBKRClient:
                     "Reconnect attempt %d failed: %s",
                     self._reconnect_failures, e,
                 )
-                # Either too many socket failures, or the app is alive but
-                # wedged on a dialog (port 4001 closed while process alive).
+
+                if not self._has_ever_connected:
+                    # Cold start: keep waiting. Surface status so the user
+                    # can see why we're idle via ibkr_connection_status.
+                    if self._is_gateway_process_alive():
+                        self._last_error = "Waiting for login at IB Gateway"
+                    else:
+                        self._last_error = "IB Gateway not running"
+                    continue
+
+                # Post-login: either too many socket failures, or the app is
+                # alive but wedged on a reconnect dialog.
                 should_restart = (
                     self._reconnect_failures >= self._config.max_reconnect_before_restart
                     or (self._is_gateway_process_alive() and self._detect_stuck_ui())
@@ -204,6 +227,59 @@ class IBKRClient:
 
     # ── Gateway app supervision (macOS) ────────────────────────────────────
 
+    async def _launch_gateway_if_needed(self) -> None:
+        """Run the launch script to open IB Gateway if it's not already running.
+
+        Used from the MCP lifespan on startup: gets the login window up in
+        front of the user so they can sign in. No-op if the process is
+        already alive (we assume they're at the login screen or the API is
+        coming up) or if no launch script is configured.
+        """
+        if self._is_gateway_process_alive():
+            self._last_error = "Waiting for login at IB Gateway"
+            logger.info("IB Gateway process already running — waiting for login")
+            return
+
+        script_path = self._config.gateway_restart_script
+        if not script_path or not os.path.isfile(script_path):
+            self._last_error = "IB Gateway not running (no launch script configured)"
+            logger.info(
+                "IB Gateway not running and no launch script configured — "
+                "set IB_GATEWAY_RESTART_SCRIPT to auto-launch"
+            )
+            return
+
+        logger.info("Launching IB Gateway from %s", script_path)
+        self._last_error = "Launching IB Gateway"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash", script_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.error("Gateway launch script timed out after 180s")
+                self._last_error = "Gateway launch script timed out"
+                return
+        except Exception as e:
+            logger.error("Failed to run gateway launch script: %s", e)
+            self._last_error = f"Gateway launch error: {e}"
+            return
+
+        if proc.returncode == 0:
+            logger.info("Gateway launch script completed successfully")
+            self._last_error = "Waiting for login at IB Gateway"
+        else:
+            tail = (stdout or b"").decode(errors="replace").strip().splitlines()[-5:]
+            logger.warning(
+                "Gateway launch script exit %d: %s",
+                proc.returncode, " | ".join(tail),
+            )
+            self._last_error = f"Gateway launch script exit {proc.returncode}"
+
     def _is_gateway_process_alive(self) -> bool:
         """True if the Java IB Gateway process is currently running."""
         try:
@@ -218,10 +294,14 @@ class IBKRClient:
     def _detect_stuck_ui(self) -> bool:
         """Detect the "reconnect"-style dialog that appears after long uptime.
 
-        Heuristic: the Gateway process is alive and has an extra window whose
-        name contains reconnect/connection/lost/disconnected, OR any dialog
-        that isn't the normal main window and presents buttons. Uses
-        AppleScript; silently returns False on any error (non-macOS, no
+        Strict keyword match only: only treat a window as stuck if its name
+        contains an explicit reconnect/disconnect/connection-lost phrase. We
+        deliberately do NOT flag "any non-main window with buttons" because
+        the login window itself is a non-main window with buttons, and we'd
+        kill the Gateway out from under a user who is simply typing their
+        password.
+
+        Uses AppleScript; silently returns False on any error (non-macOS, no
         accessibility permission, process not there, etc.).
         """
         if not self._is_gateway_process_alive():
@@ -255,11 +335,6 @@ class IBKRClient:
                             or lname contains "reconnection" then
                             return "dialog:" & wname
                         end if
-                        try
-                            if (count of buttons of w) > 0 and wname is not "" then
-                                return "dialog:" & wname
-                            end if
-                        end try
                     end if
                 end repeat
             end tell

@@ -66,7 +66,13 @@ async def ibkr_lifespan(server: FastMCP):
     try:
         await client.connect()
     except Exception as e:
-        logger.warning("Initial connection failed, starting reconnect loop: %s", e)
+        logger.warning("Initial connection failed: %s", e)
+        # If Gateway isn't running, try to launch it right now so the login
+        # window shows up immediately (instead of waiting for the first
+        # reconnect-loop iteration ~30s later). Then start the patient
+        # cold-start reconnect loop — it waits indefinitely for the user to
+        # sign in and never kills a healthy login screen.
+        await client._launch_gateway_if_needed()
         client.start_reconnect()
 
     try:
