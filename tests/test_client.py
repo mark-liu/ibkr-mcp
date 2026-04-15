@@ -147,6 +147,172 @@ class TestReconnect:
         fresh_ib.disconnectedEvent.__iadd__.assert_called()
 
 
+class TestGatewaySupervision:
+    """Tests for stuck-UI detection and kill+restart of the Gateway app."""
+
+    def _make_client(self, config, contract_cache, response_cache):
+        from ibkr_mcp.client import IBKRClient
+        return IBKRClient(config, contract_cache, response_cache)
+
+    def test_process_alive_true(self, config, contract_cache, response_cache):
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        fake = type("R", (), {"returncode": 0, "stdout": "12345\n"})()
+        with patch("ibkr_mcp.client.subprocess.run", return_value=fake):
+            assert c._is_gateway_process_alive() is True
+
+    def test_process_alive_false(self, config, contract_cache, response_cache):
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        fake = type("R", (), {"returncode": 1, "stdout": ""})()
+        with patch("ibkr_mcp.client.subprocess.run", return_value=fake):
+            assert c._is_gateway_process_alive() is False
+
+    def test_detect_stuck_ui_no_process(self, config, contract_cache, response_cache):
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        with patch.object(c, "_is_gateway_process_alive", return_value=False):
+            # Should short-circuit without calling osascript at all.
+            with patch("ibkr_mcp.client.subprocess.run") as run:
+                assert c._detect_stuck_ui() is False
+                run.assert_not_called()
+
+    def test_detect_stuck_ui_dialog_present(self, config, contract_cache, response_cache):
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        osa = type("R", (), {"stdout": "dialog:Reconnect to server\n", "stderr": ""})()
+        with patch.object(c, "_is_gateway_process_alive", return_value=True), \
+             patch("ibkr_mcp.client.shutil.which", return_value="/usr/bin/osascript"), \
+             patch("ibkr_mcp.client.subprocess.run", return_value=osa):
+            assert c._detect_stuck_ui() is True
+
+    def test_detect_stuck_ui_healthy(self, config, contract_cache, response_cache):
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        osa = type("R", (), {"stdout": "ok\n", "stderr": ""})()
+        with patch.object(c, "_is_gateway_process_alive", return_value=True), \
+             patch("ibkr_mcp.client.shutil.which", return_value="/usr/bin/osascript"), \
+             patch("ibkr_mcp.client.subprocess.run", return_value=osa):
+            assert c._detect_stuck_ui() is False
+
+    def test_detect_stuck_ui_osascript_timeout(self, config, contract_cache, response_cache):
+        import subprocess as sp
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        with patch.object(c, "_is_gateway_process_alive", return_value=True), \
+             patch("ibkr_mcp.client.shutil.which", return_value="/usr/bin/osascript"), \
+             patch("ibkr_mcp.client.subprocess.run",
+                   side_effect=sp.TimeoutExpired(cmd="osascript", timeout=5)):
+            assert c._detect_stuck_ui() is False
+
+    @pytest.mark.asyncio
+    async def test_restart_gateway_missing_script(self, config, contract_cache, response_cache, tmp_path):
+        from unittest.mock import patch
+        c = self._make_client(config, contract_cache, response_cache)
+        c._config.gateway_restart_script = str(tmp_path / "does-not-exist.sh")
+        with patch.object(c, "_kill_gateway_process"), \
+             patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch.object(c, "start_reconnect") as start_rc:
+            ok = await c._restart_gateway(reason="test")
+        assert ok is False
+        assert "Restart script missing" in (c.last_error or "")
+        start_rc.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restart_gateway_success(self, config, contract_cache, response_cache, tmp_path):
+        from unittest.mock import patch, AsyncMock, MagicMock
+        c = self._make_client(config, contract_cache, response_cache)
+
+        script = tmp_path / "fake-start.sh"
+        script.write_text("#!/bin/bash\nexit 0\n")
+        script.chmod(0o755)
+        c._config.gateway_restart_script = str(script)
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        fresh_ib = make_mock_ib(connected=True)
+
+        with patch.object(c, "_kill_gateway_process"), \
+             patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch("ibkr_mcp.client.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=fake_proc)), \
+             patch("ibkr_mcp.client.IB", return_value=fresh_ib):
+            ok = await c._restart_gateway(reason="test")
+
+        assert ok is True
+        assert c._ib is fresh_ib
+        fresh_ib.connectAsync.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restart_gateway_script_timeout(self, config, contract_cache, response_cache, tmp_path):
+        import asyncio as _asyncio
+        from unittest.mock import patch, AsyncMock, MagicMock
+        c = self._make_client(config, contract_cache, response_cache)
+
+        script = tmp_path / "fake-start.sh"
+        script.write_text("#!/bin/bash\nsleep 999\n")
+        script.chmod(0o755)
+        c._config.gateway_restart_script = str(script)
+
+        fake_proc = MagicMock()
+        fake_proc.communicate = AsyncMock(side_effect=_asyncio.TimeoutError())
+        fake_proc.kill = MagicMock()
+
+        with patch.object(c, "_kill_gateway_process"), \
+             patch.object(c, "_is_gateway_process_alive", return_value=False), \
+             patch("ibkr_mcp.client.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=fake_proc)), \
+             patch("ibkr_mcp.client.asyncio.wait_for",
+                   new=AsyncMock(side_effect=_asyncio.TimeoutError())), \
+             patch.object(c, "start_reconnect") as start_rc:
+            ok = await c._restart_gateway(reason="test")
+
+        assert ok is False
+        fake_proc.kill.assert_called_once()
+        assert "timed out" in (c.last_error or "")
+        start_rc.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_triggers_restart_when_process_alive(
+        self, config, contract_cache, response_cache
+    ):
+        """Heartbeat hang + live process → kill+restart path, not reconnect loop."""
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        c._ib = make_mock_ib(connected=True)
+        c._ib.reqCurrentTimeAsync = AsyncMock(side_effect=TimeoutError("hang"))
+
+        with patch.object(c, "_detect_stuck_ui", return_value=False), \
+             patch.object(c, "_is_gateway_process_alive", return_value=True), \
+             patch.object(c, "_restart_gateway", new=AsyncMock(return_value=True)) as rg, \
+             patch("ibkr_mcp.client.asyncio.sleep", new=AsyncMock()):
+            await c._heartbeat_loop()
+
+        rg.assert_called_once()
+        assert "heartbeat hang" in rg.call_args.kwargs.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_triggers_restart_on_stuck_ui(
+        self, config, contract_cache, response_cache
+    ):
+        """UI probe fires even when the API socket still looks healthy."""
+        from unittest.mock import patch, AsyncMock
+        c = self._make_client(config, contract_cache, response_cache)
+        c._ib = make_mock_ib(connected=True)
+
+        with patch.object(c, "_detect_stuck_ui", return_value=True), \
+             patch.object(c, "_restart_gateway", new=AsyncMock(return_value=True)) as rg, \
+             patch("ibkr_mcp.client.asyncio.sleep", new=AsyncMock()):
+            await c._heartbeat_loop()
+
+        rg.assert_called_once()
+        assert rg.call_args.kwargs.get("reason") == "stuck UI dialog"
+        # Heartbeat must NOT have been issued — UI probe short-circuits first.
+        c._ib.reqCurrentTimeAsync.assert_not_called()
+
+
 class TestContractCaching:
     @pytest.mark.asyncio
     async def test_cache_hit(self, client):

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
+import signal
+import subprocess
 from typing import Any
 
 from ib_async import IB, Contract, Forex, Stock
@@ -40,6 +44,8 @@ class IBKRClient:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._last_error: str | None = None
+        self._reconnect_failures: int = 0
+        self._restart_lock = asyncio.Lock()
 
         self._ib.disconnectedEvent += self._on_disconnect
 
@@ -97,19 +103,39 @@ class IBKRClient:
         self.start_reconnect()
 
     async def _reconnect_loop(self) -> None:
-        """Background loop that retries connection until successful."""
+        """Background loop that retries connection until successful.
+
+        After `max_reconnect_before_restart` consecutive failures, escalate to
+        a full Gateway kill+relaunch — handles the case where the app is stuck
+        on a "reconnect" dialog after a long-running session.
+        """
         while self._reconnecting and not self.is_connected:
             await asyncio.sleep(self._config.reconnect_interval)
             try:
-                # Tear down stale connection state and create fresh IB instance
-                # to avoid ib_async internal state corruption after disconnect.
                 self._ib.disconnect()
                 self._ib = IB()
                 self._ib.disconnectedEvent += self._on_disconnect
                 await self.connect()
                 logger.info("Reconnected to IB Gateway")
+                self._reconnect_failures = 0
             except Exception as e:
-                logger.debug("Reconnect attempt failed: %s", e)
+                self._reconnect_failures += 1
+                logger.debug(
+                    "Reconnect attempt %d failed: %s",
+                    self._reconnect_failures, e,
+                )
+                # Either too many socket failures, or the app is alive but
+                # wedged on a dialog (port 4001 closed while process alive).
+                should_restart = (
+                    self._reconnect_failures >= self._config.max_reconnect_before_restart
+                    or (self._is_gateway_process_alive() and self._detect_stuck_ui())
+                )
+                if should_restart:
+                    restarted = await self._restart_gateway(
+                        reason=f"{self._reconnect_failures} failed reconnects",
+                    )
+                    if restarted:
+                        self._reconnect_failures = 0
 
     # ── Heartbeat watchdog ───────────────────────────────────────────────
 
@@ -121,22 +147,37 @@ class IBKRClient:
     async def _heartbeat_loop(self) -> None:
         """Periodically verify the API connection is actually functional.
 
-        Detects zombie Gateway: TCP socket alive but API unresponsive.
-        If reqCurrentTime hangs or fails, tear down and trigger reconnect.
-        connect() restarts this loop via _start_heartbeat().
+        Detects zombie Gateway: TCP socket alive but API unresponsive, or the
+        app stuck on a "reconnect"-style dialog after a long uptime.
+        On failure, kill+restart the Gateway app if the process is alive (stuck
+        UI case) or otherwise fall through to the normal reconnect loop.
         """
         while True:
             await asyncio.sleep(self._config.heartbeat_interval)
             if not self._ib.isConnected():
                 return  # exit loop; connect() will restart via _start_heartbeat()
+
+            # Cheap UI probe even while API looks fine — catches the reconnect
+            # dialog as soon as it appears, without waiting for the next hang.
+            if self._detect_stuck_ui():
+                logger.warning("Stuck UI dialog detected on live connection — restarting Gateway")
+                self._last_error = "Stuck UI dialog detected"
+                await self._restart_gateway(reason="stuck UI dialog")
+                return
+
             try:
                 await asyncio.wait_for(
                     self._ib.reqCurrentTimeAsync(),
                     timeout=10,
                 )
             except Exception as e:
-                logger.warning("Heartbeat failed (%s) — forcing reconnect", e)
+                logger.warning("Heartbeat failed (%s)", e)
                 self._last_error = f"Heartbeat failed: {e}"
+                # If the process is still alive, the app itself is wedged
+                # (typically the reconnect dialog) — kill and restart it.
+                if self._is_gateway_process_alive():
+                    await self._restart_gateway(reason=f"heartbeat hang: {e}")
+                    return
                 self._ib.disconnect()
                 # _on_disconnect handler will start the reconnect loop
 
@@ -160,6 +201,194 @@ class IBKRClient:
                     err.cached_data = data  # type: ignore[attr-defined]
                     raise err
             raise ConnectionError("Not connected to IB Gateway")
+
+    # ── Gateway app supervision (macOS) ────────────────────────────────────
+
+    def _is_gateway_process_alive(self) -> bool:
+        """True if the Java IB Gateway process is currently running."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", self._config.gateway_process_name],
+                capture_output=True, text=True, timeout=3,
+            )
+            return result.returncode == 0 and bool(result.stdout.strip())
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+
+    def _detect_stuck_ui(self) -> bool:
+        """Detect the "reconnect"-style dialog that appears after long uptime.
+
+        Heuristic: the Gateway process is alive and has an extra window whose
+        name contains reconnect/connection/lost/disconnected, OR any dialog
+        that isn't the normal main window and presents buttons. Uses
+        AppleScript; silently returns False on any error (non-macOS, no
+        accessibility permission, process not there, etc.).
+        """
+        if not self._is_gateway_process_alive():
+            return False
+        if not shutil.which("osascript"):
+            return False
+
+        process = self._config.gateway_process_name
+        main_window = self._config.gateway_window_name
+        script = f'''
+        tell application "System Events"
+            if not (exists process "{process}") then return "no-proc"
+            tell process "{process}"
+                try
+                    set wlist to every window
+                on error
+                    return "no-win"
+                end try
+                repeat with w in wlist
+                    try
+                        set wname to name of w
+                    on error
+                        set wname to ""
+                    end try
+                    if wname is not "{main_window}" then
+                        set lname to my toLower(wname)
+                        if lname contains "reconnect" ¬
+                            or lname contains "connection lost" ¬
+                            or lname contains "disconnect" ¬
+                            or lname contains "re-connect" ¬
+                            or lname contains "reconnection" then
+                            return "dialog:" & wname
+                        end if
+                        try
+                            if (count of buttons of w) > 0 and wname is not "" then
+                                return "dialog:" & wname
+                            end if
+                        end try
+                    end if
+                end repeat
+            end tell
+            return "ok"
+        end tell
+
+        on toLower(s)
+            set lower to ""
+            repeat with c in s
+                set ci to id of c
+                if ci ≥ 65 and ci ≤ 90 then
+                    set lower to lower & (character id (ci + 32))
+                else
+                    set lower to lower & c
+                end if
+            end repeat
+            return lower
+        end toLower
+        '''
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        out = (result.stdout or "").strip()
+        if out.startswith("dialog:"):
+            logger.warning("IB Gateway stuck dialog: %s", out[len("dialog:"):])
+            return True
+        return False
+
+    async def _restart_gateway(self, reason: str) -> bool:
+        """Kill the IB Gateway app and re-run the launch script.
+
+        Serialised via a lock so heartbeat/reconnect loops don't race. Returns
+        True if the relaunch script exited 0 and we believe the Gateway is up.
+        """
+        if self._restart_lock.locked():
+            logger.info("Restart already in progress — skipping (reason=%s)", reason)
+            return False
+
+        async with self._restart_lock:
+            logger.warning("Restarting IB Gateway app — reason: %s", reason)
+            self._last_error = f"Restarting Gateway: {reason}"
+
+            # Detach our socket first so ib_async doesn't fight the restart.
+            try:
+                self._ib.disconnect()
+            except Exception:
+                pass
+
+            # Kill the Java process — SIGTERM then SIGKILL fallback.
+            self._kill_gateway_process(signal.SIGTERM)
+            for _ in range(10):
+                if not self._is_gateway_process_alive():
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                self._kill_gateway_process(signal.SIGKILL)
+                await asyncio.sleep(1)
+
+            script_path = self._config.gateway_restart_script
+            if not os.path.isfile(script_path):
+                logger.error("Gateway restart script not found: %s", script_path)
+                self._last_error = f"Restart script missing: {script_path}"
+                self.start_reconnect()
+                return False
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash", script_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    logger.error("Gateway restart script timed out after 180s")
+                    self._last_error = "Gateway restart script timed out"
+                    self.start_reconnect()
+                    return False
+            except Exception as e:
+                logger.error("Failed to run gateway restart script: %s", e)
+                self._last_error = f"Restart script error: {e}"
+                self.start_reconnect()
+                return False
+
+            if proc.returncode != 0:
+                tail = (stdout or b"").decode(errors="replace").strip().splitlines()[-5:]
+                logger.error(
+                    "Gateway restart script exit %d: %s",
+                    proc.returncode, " | ".join(tail),
+                )
+                self._last_error = f"Restart script exit {proc.returncode}"
+                self.start_reconnect()
+                return False
+
+            logger.info("Gateway restart script completed — reconnecting client")
+            # Fresh IB instance: the previous one is now in a terminal state.
+            self._ib = IB()
+            self._ib.disconnectedEvent += self._on_disconnect
+            try:
+                await self.connect()
+                self._reconnect_failures = 0
+                return True
+            except Exception as e:
+                logger.warning("Post-restart connect failed: %s — falling back to reconnect loop", e)
+                self._last_error = f"Post-restart connect failed: {e}"
+                self.start_reconnect()
+                return False
+
+    def _kill_gateway_process(self, sig: int) -> None:
+        """Send `sig` to every matching Gateway process. Best-effort."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", self._config.gateway_process_name],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+        for line in result.stdout.strip().splitlines():
+            try:
+                pid = int(line.strip())
+                os.kill(pid, sig)
+                logger.info("Sent %s to Gateway PID %d", sig.name if hasattr(sig, "name") else sig, pid)
+            except (ProcessLookupError, PermissionError, ValueError):
+                continue
 
     # ── Contract resolution with caching ───────────────────────────────────
 
