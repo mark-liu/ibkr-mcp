@@ -186,6 +186,36 @@ class TestGatewaySupervision:
              patch("ibkr_mcp.client.subprocess.run", return_value=osa):
             assert c._detect_stuck_ui() is True
 
+    @pytest.mark.parametrize("dialog_title", [
+        "Reconnect to server",
+        "Connection Lost",
+        "Re-login is required",    # observed 2026-04-18 after long idle
+        "Attempt 15: Authenticating...",  # Gateway's own retry loop
+        "CONNECTION LOST",          # case-insensitive
+    ])
+    def test_detect_stuck_ui_known_titles(
+        self, config, contract_cache, response_cache, dialog_title
+    ):
+        """Each observed stuck-dialog title must be caught by the keyword list."""
+        from ibkr_mcp.client import IBKRClient
+        lowered = dialog_title.lower()
+        assert any(kw in lowered for kw in IBKRClient._STUCK_DIALOG_KEYWORDS), (
+            f"{dialog_title!r} matches none of {IBKRClient._STUCK_DIALOG_KEYWORDS}"
+        )
+
+    @pytest.mark.parametrize("benign_title", [
+        "IBKR Gateway",                    # main window
+        "Second Factor Authentication",    # 2FA dialog, must NOT match
+        "File Save",                       # generic dialogs
+    ])
+    def test_detect_stuck_ui_benign_titles(self, benign_title):
+        """Benign dialog titles must NOT hit any keyword (esp. 2FA vs 'authenticating')."""
+        from ibkr_mcp.client import IBKRClient
+        lowered = benign_title.lower()
+        assert not any(kw in lowered for kw in IBKRClient._STUCK_DIALOG_KEYWORDS), (
+            f"{benign_title!r} unexpectedly matches a stuck-UI keyword"
+        )
+
     def test_detect_stuck_ui_healthy(self, config, contract_cache, response_cache):
         from unittest.mock import patch
         c = self._make_client(config, contract_cache, response_cache)

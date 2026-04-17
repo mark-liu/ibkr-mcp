@@ -35,6 +35,25 @@ def _is_market_open() -> bool:
 class IBKRClient:
     """Wrapper around ib_async.IB with connection management and caching."""
 
+    # Lowercase substrings that mark a non-main window as a "stuck" dialog.
+    # Observed titles in the wild:
+    #   "Reconnect to server", "Connection Lost", "Re-login is required",
+    #   "Attempt 15: Authenticating..."
+    # Deliberately does NOT include "authentication" — the 2FA window is
+    # "Second Factor Authentication" and must not be flagged.
+    _STUCK_DIALOG_KEYWORDS: tuple[str, ...] = (
+        "reconnect",
+        "re-connect",
+        "reconnection",
+        "connection lost",
+        "disconnect",
+        "re-login",
+        "relogin",
+        "login is required",
+        "login required",
+        "authenticating",
+    )
+
     def __init__(self, config: IBKRConfig, contract_cache: ContractCache, response_cache: ResponseCache) -> None:
         self._config = config
         self._ib = IB()
@@ -295,11 +314,20 @@ class IBKRClient:
         """Detect the "reconnect"-style dialog that appears after long uptime.
 
         Strict keyword match only: only treat a window as stuck if its name
-        contains an explicit reconnect/disconnect/connection-lost phrase. We
+        contains an explicit reconnect/re-login/authenticating phrase. We
         deliberately do NOT flag "any non-main window with buttons" because
         the login window itself is a non-main window with buttons, and we'd
         kill the Gateway out from under a user who is simply typing their
         password.
+
+        Known stuck-dialog titles observed in the wild:
+          * "Reconnect to server"
+          * "Connection Lost"
+          * "Re-login is required"   — appears after long idle
+          * "Attempt N: Authenticating..." — Gateway's own retry loop
+
+        The 2FA window is named "Second Factor Authentication" ("authentication",
+        not "authenticating") so it does not match the "authenticating" keyword.
 
         Uses AppleScript; silently returns False on any error (non-macOS, no
         accessibility permission, process not there, etc.).
@@ -311,6 +339,11 @@ class IBKRClient:
 
         process = self._config.gateway_process_name
         main_window = self._config.gateway_window_name
+        # Build the AppleScript `contains` chain from the shared keyword list
+        # so tests can assert against the same source of truth.
+        contains_chain = " ¬\n                            or ".join(
+            f'lname contains "{kw}"' for kw in self._STUCK_DIALOG_KEYWORDS
+        )
         script = f'''
         tell application "System Events"
             if not (exists process "{process}") then return "no-proc"
@@ -328,11 +361,7 @@ class IBKRClient:
                     end try
                     if wname is not "{main_window}" then
                         set lname to my toLower(wname)
-                        if lname contains "reconnect" ¬
-                            or lname contains "connection lost" ¬
-                            or lname contains "disconnect" ¬
-                            or lname contains "re-connect" ¬
-                            or lname contains "reconnection" then
+                        if {contains_chain} then
                             return "dialog:" & wname
                         end if
                     end if
